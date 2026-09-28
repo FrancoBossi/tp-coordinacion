@@ -24,6 +24,7 @@ class AggregationFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
         self.fruit_top_by_request = {}
+        self.completed_sums_by_request = {}
 
     def _process_data(self, request_id, fruit, amount):
         logging.info("Processing data message")
@@ -37,10 +38,16 @@ class AggregationFilter:
                 return
         bisect.insort(fruit_top, fruit_item.FruitItem(fruit, amount))
 
-    def _process_eof(self, request_id):
-        logging.info("Received EOF")
+    def _process_eof(self, request_id, sum_id):
+        logging.info("Received EOF from Sum")
+        completed_sums = self.completed_sums_by_request.setdefault(request_id, set())
+        completed_sums.add(int(sum_id))
+        if len(completed_sums) < SUM_AMOUNT:
+            return
+
         # El resultado conserva el request_id para que el Gateway lo correlacione.
         fruit_top = self.fruit_top_by_request.pop(request_id, [])
+        self.completed_sums_by_request.pop(request_id, None)
         fruit_chunk = list(fruit_top[-TOP_SIZE:])
         fruit_chunk.reverse()
         serialized_fruit_top = list(
@@ -51,7 +58,7 @@ class AggregationFilter:
         )
         self.output_queue.send(
             message_protocol.internal.serialize(
-                [request_id, serialized_fruit_top]
+                [request_id, "PARTIAL_TOP", ID, serialized_fruit_top]
             )
         )
 
@@ -60,8 +67,8 @@ class AggregationFilter:
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 4 and fields[1] == "DATA":
             self._process_data(fields[0], fields[2], fields[3])
-        elif len(fields) == 2 and fields[1] == "EOF":
-            self._process_eof(fields[0])
+        elif len(fields) == 3 and fields[1] == "EOF":
+            self._process_eof(fields[0], fields[2])
         else:
             nack()
             return

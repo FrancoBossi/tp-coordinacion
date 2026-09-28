@@ -22,6 +22,8 @@ class MessageHandler:
     def deserialize_result_message(self, message):
         #Acepta unicamente resultados pertenecientes a esta consulta
         fields = message_protocol.internal.deserialize(message)
-        if len(fields) != 2 or fields[0] != self.request_id:
+        if len(fields) != 3 or fields[0] != self.request_id:
             return []
-        return fields[1]
+        if fields[1] != "FINAL_TOP":
+            return []
+        return fields[2]

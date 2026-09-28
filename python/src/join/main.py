@@ -22,15 +22,30 @@ class JoinFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
+        self.partial_tops_by_request = {}
 
     def process_messsage(self, message, ack, nack):
         logging.info("Received top")
         fields = message_protocol.internal.deserialize(message)
-        if len(fields) != 2 or not isinstance(fields[0], str):
+        if len(fields) != 4 or fields[1] != "PARTIAL_TOP":
             nack()
             return
-        # El Join todavía no consolida tops; sólo preserva su correlación.
-        self.output_queue.send(message_protocol.internal.serialize(fields))
+        partial_tops = self.partial_tops_by_request.setdefault(fields[0], {})
+        partial_tops[fields[2]] = fields[3]
+        if len(partial_tops) == AGGREGATION_AMOUNT:
+            totals = {}
+            for partial_top in partial_tops.values():
+                for fruit, amount in partial_top:
+                    totals[fruit] = totals.get(fruit, 0) + int(amount)
+            final_top = sorted(
+                totals.items(), key=lambda item: (item[1], item[0]), reverse=True
+            )[:TOP_SIZE]
+            self.partial_tops_by_request.pop(fields[0], None)
+            self.output_queue.send(
+                message_protocol.internal.serialize(
+                    [fields[0], "FINAL_TOP", final_top]
+                )
+            )
         ack()
 
     def start(self):
