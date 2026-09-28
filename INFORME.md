@@ -32,14 +32,18 @@ Cada Sum mantiene acumuladores independientes por `request_id`. Para evitar que
 el uso de memoria crezca indefinidamente con el volumen de datos, los
 acumuladores se dividen en lotes limitados por `SUM_BATCH_SIZE`. Cuando un lote
 alcanza el límite configurado, Sum envía sus subtotales y libera la memoria
-asociada. Al recibir el cierre de una consulta, envía el lote restante y una
-notificación de finalización identificada con el `request_id` y el identificador
-de la instancia de Sum.
+asociada. Al recibir el cierre de una consulta, el Gateway incluye en el mensaje EOF la
+cantidad total de registros de esa consulta. Cada Sum informa su progreso por
+`request_id` y por instancia. Las réplicas mantienen una barrera distribuida y
+envían el lote restante y su notificación de finalización sólo cuando la suma
+de los progresos alcanza la cantidad total esperada.
 
-La notificación de finalización se publica mediante un exchange de control para
-que todas las réplicas de Sum puedan cerrar el estado local correspondiente a
-la consulta. Aggregation considera finalizada una consulta cuando recibe la
-notificación de todas las instancias de Sum configuradas.
+Las notificaciones de progreso y de cierre se publican mediante un exchange de
+control para que todas las réplicas de Sum conozcan el estado de la consulta.
+El cierre de cada Sum se publica en el mismo flujo de salida que sus datos, de
+modo que Aggregation recibe los mensajes DATA antes del EOF correspondiente.
+Aggregation considera finalizada una consulta cuando recibe la notificación de
+todas las instancias de Sum configuradas.
 
 ## Distribución entre Aggregation
 

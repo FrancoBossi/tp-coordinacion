@@ -35,6 +35,7 @@ class AggregationFilter:
                 fruit_top[i] = fruit_top[i] + fruit_item.FruitItem(
                     fruit, amount
                 )
+                fruit_top.sort()
                 return
         bisect.insort(fruit_top, fruit_item.FruitItem(fruit, amount))
 

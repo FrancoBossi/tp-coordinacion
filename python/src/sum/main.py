@@ -2,8 +2,6 @@ import os
 import logging
 import threading
 import hashlib
-import time
-import pika
 
 from common import middleware, message_protocol, fruit_item
 
@@ -29,9 +27,13 @@ class SumFilter:
             )
             self.data_output_exchanges.append(data_output_exchange)
         self.control_publisher = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, SUM_CONTROL_EXCHANGE, ["EOF"]
+            MOM_HOST, SUM_CONTROL_EXCHANGE, ["CONTROL"]
         )
         self.amount_by_request = {}
+        self.local_processed_by_request = {}
+        self.progress_by_request = {}
+        self.expected_by_request = {}
+        self.closed_requests = set()
         self.state_lock = threading.Lock()
 
     def _aggregation_index(self, request_id, fruit):
@@ -81,37 +83,58 @@ class SumFilter:
             message_protocol.internal.serialize([request_id, "EOF", ID])
         )
 
-    def _process_control_message(self, message, ack, nack, output_exchanges):
-        """Procesa un EOF difundido para que cada Sum cierre su estado local."""
+    def _process_control_message(self, message, ack, nack):
+        """Actualiza la barrera de progreso y cierra consultas completas."""
         fields = message_protocol.internal.deserialize(message)
-        if len(fields) != 3 or fields[1] != "EOF":
+        if len(fields) != 3:
             nack()
             return
-        self._wait_for_input_queue_drain()
+        request_id, message_type, value = fields
         with self.state_lock:
-            self._flush_request_to_exchanges(fields[0], output_exchanges)
-            for data_output_exchange in output_exchanges:
-                data_output_exchange.send(
-                    message_protocol.internal.serialize([fields[0], "EOF", ID])
-                )
+            if message_type == "EOF_REQUEST":
+                self.expected_by_request[request_id] = int(value)
+            elif message_type == "PROGRESS":
+                self.progress_by_request.setdefault(request_id, {})[
+                    int(value[0])
+                ] = int(value[1])
+            else:
+                nack()
+                return
+            should_close = self._request_is_complete(request_id)
+        if should_close:
+            self._schedule_close(request_id)
         ack()
 
-    def _wait_for_input_queue_drain(self):
-        """Espera a que todos los datos previos al EOF sean entregados a un Sum."""
-        connection = pika.BlockingConnection(
-            pika.ConnectionParameters(host=MOM_HOST)
+    def _request_is_complete(self, request_id):
+        """Indica si todos los registros de una consulta ya fueron procesados."""
+        expected = self.expected_by_request.get(request_id)
+        progress = self.progress_by_request.get(request_id, {})
+        return (
+            expected is not None
+            and sum(progress.values()) >= expected
+            and request_id not in self.closed_requests
         )
-        channel = connection.channel()
-        try:
-            while True:
-                queue_state = channel.queue_declare(
-                    queue=INPUT_QUEUE, passive=True
+
+    def _schedule_close(self, request_id):
+        """Programa el cierre en el hilo que publica los datos de Sum."""
+        self.input_queue.connection.add_callback_threadsafe(
+            lambda: self._close_request(request_id)
+        )
+
+    def _close_request(self, request_id):
+        """Publica el cierre después de que todos los Sum procesaron sus datos."""
+        with self.state_lock:
+            if request_id in self.closed_requests:
+                return
+            self.closed_requests.add(request_id)
+            self._flush_request_to_exchanges(request_id, self.data_output_exchanges)
+            for data_output_exchange in self.data_output_exchanges:
+                data_output_exchange.send(
+                    message_protocol.internal.serialize([request_id, "EOF", ID])
                 )
-                if queue_state.method.message_count == 0:
-                    return
-                time.sleep(0.01)
-        finally:
-            connection.close()
+            self.local_processed_by_request.pop(request_id, None)
+            self.progress_by_request.pop(request_id, None)
+            self.expected_by_request.pop(request_id, None)
 
     def _flush_request_to_exchanges(self, request_id, output_exchanges):
         """Envía un lote usando exchanges pertenecientes al hilo consumidor."""
@@ -135,9 +158,21 @@ class SumFilter:
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 4 and fields[1] == "DATA":
             self._process_data(fields[0], fields[2], fields[3])
-        elif len(fields) == 2 and fields[1] == "EOF":
+            with self.state_lock:
+                processed = (
+                    self.local_processed_by_request.get(fields[0], 0) + 1
+                )
+                self.local_processed_by_request[fields[0]] = processed
             self.control_publisher.send(
-                message_protocol.internal.serialize([fields[0], "EOF", ID])
+                message_protocol.internal.serialize(
+                    [fields[0], "PROGRESS", [ID, processed]]
+                )
+            )
+        elif len(fields) == 3 and fields[1] == "EOF":
+            self.control_publisher.send(
+                message_protocol.internal.serialize(
+                    [fields[0], "EOF_REQUEST", fields[2]]
+                )
             )
         else:
             nack()
@@ -148,17 +183,11 @@ class SumFilter:
         # El exchange de control permite notificar EOF a todas las réplicas de Sum.
         def consume_control():
             control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-                MOM_HOST, SUM_CONTROL_EXCHANGE, ["EOF"]
+                MOM_HOST, SUM_CONTROL_EXCHANGE, ["CONTROL"]
             )
-            output_exchanges = [
-                middleware.MessageMiddlewareExchangeRabbitMQ(
-                    MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
-                )
-                for i in range(AGGREGATION_AMOUNT)
-            ]
             control_exchange.start_consuming(
                 lambda message, ack, nack: self._process_control_message(
-                    message, ack, nack, output_exchanges
+                    message, ack, nack
                 )
             )
 
