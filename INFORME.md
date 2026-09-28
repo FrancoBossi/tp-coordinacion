@@ -110,3 +110,15 @@ fruta se enruta a un único Aggregator usando una partición determinista. Join
 espera la participación de todas las réplicas de Aggregation antes de producir
 el resultado final. Así, las réplicas agregan capacidad de procesamiento en
 lugar de repetir el mismo trabajo.
+
+## Terminación ordenada
+
+Sum, Aggregation y Join registran un handler para la señal `SIGTERM`. El handler
+solicita detener el consumo de mensajes, pero no cierra inmediatamente la
+conexión que todavía está siendo utilizada por RabbitMQ. Una vez que el consumo
+finaliza, cada proceso cierra sus colas, exchanges y conexiones en un bloque
+`finally`.
+
+Esta separación evita cerrar un descriptor mientras Pika está procesando
+eventos. Como resultado, las réplicas terminan limpiamente con código de salida
+`0` al detener los contenedores.

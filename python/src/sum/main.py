@@ -2,6 +2,7 @@ import os
 import logging
 import threading
 import hashlib
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -35,6 +36,10 @@ class SumFilter:
         self.expected_by_request = {}
         self.closed_requests = set()
         self.state_lock = threading.Lock()
+        self.shutdown_event = threading.Event()
+        self.control_exchange = None
+        self.control_thread = None
+        self.shutdown_requested = False
 
     def _aggregation_index(self, request_id, fruit):
         """Distribuye cada fruta de una consulta en un único Aggregator."""
@@ -182,23 +187,55 @@ class SumFilter:
     def start(self):
         # El exchange de control permite notificar EOF a todas las réplicas de Sum.
         def consume_control():
-            control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+            self.control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
                 MOM_HOST, SUM_CONTROL_EXCHANGE, ["CONTROL"]
             )
-            control_exchange.start_consuming(
+            self.control_exchange.start_consuming(
                 lambda message, ack, nack: self._process_control_message(
                     message, ack, nack
                 )
             )
 
-        control_thread = threading.Thread(target=consume_control, daemon=True)
-        control_thread.start()
+        self.control_thread = threading.Thread(target=consume_control, daemon=True)
+        self.control_thread.start()
         self.input_queue.start_consuming(self.process_data_messsage)
+
+    def request_shutdown(self):
+        """Solicita detener los consumidores sin cerrar conexiones activas."""
+        if self.shutdown_requested:
+            return
+        self.shutdown_requested = True
+        self.shutdown_event.set()
+        self.input_queue.stop_consuming()
+        if self.control_exchange is not None:
+            self.control_exchange.connection.add_callback_threadsafe(
+                self.control_exchange.stop_consuming
+            )
+
+    def shutdown(self):
+        """Cierra las conexiones de Sum después de detener los consumidores."""
+        self.request_shutdown()
+        if self.control_thread is not None:
+            self.control_thread.join(timeout=5)
+        self.input_queue.close()
+        if self.control_exchange is not None:
+            self.control_exchange.close()
+        self.control_publisher.close()
+        for data_output_exchange in self.data_output_exchanges:
+            data_output_exchange.close()
+
 
 def main():
     logging.basicConfig(level=logging.INFO)
     sum_filter = SumFilter()
-    sum_filter.start()
+    signal.signal(
+        signal.SIGTERM,
+        lambda signum, frame: sum_filter.request_shutdown(),
+    )
+    try:
+        sum_filter.start()
+    finally:
+        sum_filter.shutdown()
     return 0
 
 

@@ -1,5 +1,6 @@
 import os
 import logging
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -23,6 +24,7 @@ class JoinFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
         self.partial_tops_by_request = {}
+        self.shutdown_requested = False
 
     def process_messsage(self, message, ack, nack):
         logging.info("Received top")
@@ -51,11 +53,31 @@ class JoinFilter:
     def start(self):
         self.input_queue.start_consuming(self.process_messsage)
 
+    def request_shutdown(self):
+        """Solicita detener el consumo sin cerrar la conexión activa."""
+        if self.shutdown_requested:
+            return
+        self.shutdown_requested = True
+        self.input_queue.stop_consuming()
+
+    def shutdown(self):
+        """Cierra las conexiones después de detener el consumo."""
+        self.request_shutdown()
+        self.input_queue.close()
+        self.output_queue.close()
+
 
 def main():
     logging.basicConfig(level=logging.INFO)
     join_filter = JoinFilter()
-    join_filter.start()
+    signal.signal(
+        signal.SIGTERM,
+        lambda signum, frame: join_filter.request_shutdown(),
+    )
+    try:
+        join_filter.start()
+    finally:
+        join_filter.shutdown()
 
     return 0
 

@@ -1,6 +1,7 @@
 import os
 import logging
 import bisect
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -25,6 +26,7 @@ class AggregationFilter:
         )
         self.fruit_top_by_request = {}
         self.completed_sums_by_request = {}
+        self.shutdown_requested = False
 
     def _process_data(self, request_id, fruit, amount):
         logging.info("Processing data message")
@@ -78,11 +80,31 @@ class AggregationFilter:
     def start(self):
         self.input_exchange.start_consuming(self.process_messsage)
 
+    def request_shutdown(self):
+        """Solicita detener el consumo sin cerrar la conexión activa."""
+        if self.shutdown_requested:
+            return
+        self.shutdown_requested = True
+        self.input_exchange.stop_consuming()
+
+    def shutdown(self):
+        """Cierra las conexiones después de detener el consumo."""
+        self.request_shutdown()
+        self.input_exchange.close()
+        self.output_queue.close()
+
 
 def main():
     logging.basicConfig(level=logging.INFO)
     aggregation_filter = AggregationFilter()
-    aggregation_filter.start()
+    signal.signal(
+        signal.SIGTERM,
+        lambda signum, frame: aggregation_filter.request_shutdown(),
+    )
+    try:
+        aggregation_filter.start()
+    finally:
+        aggregation_filter.shutdown()
     return 0
 
 
