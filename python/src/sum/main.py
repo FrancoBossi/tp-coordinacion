@@ -12,6 +12,7 @@ SUM_PREFIX = os.environ["SUM_PREFIX"]
 SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
+SUM_BATCH_SIZE = int(os.environ.get("SUM_BATCH_SIZE", "1000"))
 
 class SumFilter:
     def __init__(self):
@@ -26,17 +27,8 @@ class SumFilter:
             self.data_output_exchanges.append(data_output_exchange)
         self.amount_by_request = {}
 
-    def _process_data(self, request_id, fruit, amount):
-        logging.info(f"Process data")
-        # Cada cliente conserva su propio acumulador para evitar mezclar consultas.
-        amount_by_fruit = self.amount_by_request.setdefault(request_id, {})
-        amount_by_fruit[fruit] = amount_by_fruit.get(
-            fruit, fruit_item.FruitItem(fruit, 0)
-        ) + fruit_item.FruitItem(fruit, int(amount))
-
-    def _process_eof(self, request_id):
-        logging.info(f"Broadcasting data messages")
-        # Sólo se libera el estado de la consulta que terminó.
+    def _flush_request(self, request_id):
+        """Envía un lote y libera el acumulador de una consulta."""
         amount_by_fruit = self.amount_by_request.pop(request_id, {})
         for final_fruit_item in amount_by_fruit.values():
             for data_output_exchange in self.data_output_exchanges:
@@ -50,6 +42,23 @@ class SumFilter:
                         ]
                     )
                 )
+
+    def _process_data(self, request_id, fruit, amount):
+        logging.info(f"Process data")
+        # Cada cliente conserva su propio acumulador para evitar mezclar consultas.
+        amount_by_fruit = self.amount_by_request.setdefault(request_id, {})
+        amount_by_fruit[fruit] = amount_by_fruit.get(
+            fruit, fruit_item.FruitItem(fruit, 0)
+        ) + fruit_item.FruitItem(fruit, int(amount))
+
+        if len(amount_by_fruit) >= SUM_BATCH_SIZE:
+            logging.info("Flushing data batch")
+            self._flush_request(request_id)
+
+    def _process_eof(self, request_id):
+        logging.info(f"Broadcasting data messages")
+        # Envía el último lote; los anteriores ya fueron liberados al alcanzar el límite.
+        self._flush_request(request_id)
 
         logging.info(f"Broadcasting EOF message")
         for data_output_exchange in self.data_output_exchanges:
