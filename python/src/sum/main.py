@@ -99,7 +99,7 @@ class SumFilter:
     def _wait_for_input_queue_drain(self):
         """Espera a que todos los datos previos al EOF sean entregados a un Sum."""
         connection = pika.BlockingConnection(
-            middleware.connection_parameters(MOM_HOST)
+            pika.ConnectionParameters(host=MOM_HOST)
         )
         channel = connection.channel()
         try:
@@ -136,7 +136,7 @@ class SumFilter:
         if len(fields) == 4 and fields[1] == "DATA":
             self._process_data(fields[0], fields[2], fields[3])
         elif len(fields) == 2 and fields[1] == "EOF":
-            self.control_exchange.send(
+            self.control_publisher.send(
                 message_protocol.internal.serialize([fields[0], "EOF", ID])
             )
         else:
