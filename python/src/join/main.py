@@ -54,17 +54,17 @@ class JoinFilter:
         self.input_queue.start_consuming(self.process_messsage)
 
     def request_shutdown(self):
-        """Solicita detener el consumo sin cerrar la conexión activa."""
+        #Solicita detener el consumo sin cerrar la conexion activa
         if self.shutdown_requested:
             return
         self.shutdown_requested = True
         self.input_queue.stop_consuming()
 
     def shutdown(self):
-        """Cierra las conexiones después de detener el consumo."""
+        #cierra las conexiones despues de detener el consumo
         self.request_shutdown()
-        self.input_queue.close()
-        self.output_queue.close()
+        self.input_queue.close() #conexion cerrada
+        self.output_queue.close() #conexion cerrada
 
 
 def main():

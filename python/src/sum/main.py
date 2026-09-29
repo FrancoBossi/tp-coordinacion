@@ -42,13 +42,13 @@ class SumFilter:
         self.shutdown_requested = False
 
     def _aggregation_index(self, request_id, fruit):
-        """Distribuye cada fruta de una consulta en un único Aggregator."""
+        #Distribuye cada fruta de una consulta en un unico Aggregator
         partition_key = f"{request_id}:{fruit}"
         digest = hashlib.sha256(partition_key.encode("utf-8")).digest()
         return int.from_bytes(digest[:8], "big") % AGGREGATION_AMOUNT
 
     def _flush_request(self, request_id):
-        """Envía un lote y libera el acumulador de una consulta."""
+        #enviamos un lote y libera el acumulador de una consulta
         amount_by_fruit = self.amount_by_request.pop(request_id, {})
         for final_fruit_item in amount_by_fruit.values():
             data_output_exchange = self.data_output_exchanges[
@@ -68,7 +68,7 @@ class SumFilter:
     def _process_data(self, request_id, fruit, amount):
         logging.info(f"Process data")
         with self.state_lock:
-            # Cada cliente conserva su propio acumulador para evitar mezclar consultas.
+            # Cada cliente conserva su propio acumulador para evitar mezclar otras/futuras consultas
             amount_by_fruit = self.amount_by_request.setdefault(request_id, {})
             amount_by_fruit[fruit] = amount_by_fruit.get(
                 fruit, fruit_item.FruitItem(fruit, 0)
@@ -80,7 +80,7 @@ class SumFilter:
 
     def _process_eof(self, request_id):
         logging.info(f"Broadcasting data messages")
-        # Envía el último lote; los anteriores ya fueron liberados al alcanzar el límite.
+        # Envia el ultimo lote, los anteriores ya fueron liberados al alcanzar el limite
         self._flush_request(request_id)
 
         logging.info(f"Publishing EOF notification for sum {ID}")
@@ -89,7 +89,7 @@ class SumFilter:
         )
 
     def _process_control_message(self, message, ack, nack):
-        """Actualiza la barrera de progreso y cierra consultas completas."""
+        #Actualiza la barrera de progreso y cierra consultas completas
         fields = message_protocol.internal.deserialize(message)
         if len(fields) != 3:
             nack()
@@ -111,7 +111,7 @@ class SumFilter:
         ack()
 
     def _request_is_complete(self, request_id):
-        """Indica si todos los registros de una consulta ya fueron procesados."""
+        #Indica si todos los registros de una consulta ya fueron procesados
         expected = self.expected_by_request.get(request_id)
         progress = self.progress_by_request.get(request_id, {})
         return (
@@ -121,13 +121,13 @@ class SumFilter:
         )
 
     def _schedule_close(self, request_id):
-        """Programa el cierre en el hilo que publica los datos de Sum."""
+        #Programa el cierre en el hilo que publica los datos de Sum
         self.input_queue.connection.add_callback_threadsafe(
             lambda: self._close_request(request_id)
         )
 
     def _close_request(self, request_id):
-        """Publica el cierre después de que todos los Sum procesaron sus datos."""
+        #Publica el cierre despues de que todos los Sum procesaron sus datos
         with self.state_lock:
             if request_id in self.closed_requests:
                 return
@@ -142,7 +142,7 @@ class SumFilter:
             self.expected_by_request.pop(request_id, None)
 
     def _flush_request_to_exchanges(self, request_id, output_exchanges):
-        """Envía un lote usando exchanges pertenecientes al hilo consumidor."""
+        #Envia un lote usando exchanges pertenecientes al hilo consumidor
         amount_by_fruit = self.amount_by_request.pop(request_id, {})
         for final_fruit_item in amount_by_fruit.values():
             output_exchange = output_exchanges[
@@ -185,7 +185,7 @@ class SumFilter:
         ack()
 
     def start(self):
-        # El exchange de control permite notificar EOF a todas las réplicas de Sum.
+        # El exchange de control permite notificar EOF a todas las replicas de Sum
         def consume_control():
             self.control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
                 MOM_HOST, SUM_CONTROL_EXCHANGE, ["CONTROL"]
@@ -201,7 +201,7 @@ class SumFilter:
         self.input_queue.start_consuming(self.process_data_messsage)
 
     def request_shutdown(self):
-        """Solicita detener los consumidores sin cerrar conexiones activas."""
+        #Solicita detener los consumidores sin cerrar conexiones activas
         if self.shutdown_requested:
             return
         self.shutdown_requested = True
@@ -213,7 +213,7 @@ class SumFilter:
             )
 
     def shutdown(self):
-        """Cierra las conexiones de Sum después de detener los consumidores."""
+        #Cierra las conexiones de Sum despues de detener los consumidores
         self.request_shutdown()
         if self.control_thread is not None:
             self.control_thread.join(timeout=5)
