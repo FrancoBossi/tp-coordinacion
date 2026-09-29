@@ -81,17 +81,17 @@ class AggregationFilter:
         self.input_exchange.start_consuming(self.process_messsage)
 
     def request_shutdown(self):
-        """Solicita detener el consumo sin cerrar la conexión activa."""
+        #Solicita detener el consumo sin cerrar la conexion activa
         if self.shutdown_requested:
             return
         self.shutdown_requested = True
         self.input_exchange.stop_consuming()
 
     def shutdown(self):
-        """Cierra las conexiones después de detener el consumo."""
+        #cerramos las conexiones despues de detener el consumo
         self.request_shutdown()
-        self.input_exchange.close()
-        self.output_queue.close()
+        self.input_exchange.close() #cerramos conexion
+        self.output_queue.close() #cerramos conexion
 
 
 def main():
