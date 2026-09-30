@@ -6,6 +6,7 @@ import signal
 
 from common import middleware, message_protocol, fruit_item
 
+# Configuración del nodo desde variables de entorno
 ID = int(os.environ["ID"])
 MOM_HOST = os.environ["MOM_HOST"]
 INPUT_QUEUE = os.environ["INPUT_QUEUE"]
@@ -17,61 +18,69 @@ AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 
 class SumFilter:
     def __init__(self):
-        # Ingesta desde la cola principal (Hilo principal)
+        # Cola de ingesta principal
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, INPUT_QUEUE
         )
-        
-        # Salida hacia Aggregation (Hilo principal)
+
+        # Exchanges de salida hacia las replicas de Aggregation
         self.data_output_exchanges = [
             middleware.MessageMiddlewareExchangeRabbitMQ(
                 MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
             )
             for i in range(AGGREGATION_AMOUNT)
         ]
-        
-        # Envío inter-sum desde el Hilo principal
+
+        # Exchanges de envio para comunicacion inter-sum (hilo principal)
         self.sum_inter_exchanges = [
             middleware.MessageMiddlewareExchangeRabbitMQ(
                 MOM_HOST, SUM_PREFIX, [f"{SUM_PREFIX}_{i}"]
             )
             for i in range(SUM_AMOUNT)
         ]
-        
-        # Recepción inter-sum (Hilo secundario)
+
+        # Exchange de recepcion de datos re-enrutados (hilo secundario)
         self.sum_input_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, SUM_PREFIX, [f"{SUM_PREFIX}_{ID}"]
         )
 
-        # Estado interno por request
+        # Diccionarios de estado interno protegidos por lock
         self.amount_by_request = {}
         self.eof_broadcast_sent = set()
         self.eofs_received_by_request = {}
         self.closed_requests = set()
-        
+
         self.state_lock = threading.Lock()
         self.sum_inter_thread = None
         self.inter_sum_publishers = None
         self.shutdown_requested = False
 
-    def _sum_owner_index(self, request_id, fruit):
+    def _sum_owner_index(self, request_id: str, fruit: str) -> int:
+        #Calcula el ID de la replica de Sum responsable de acumular la fruta dada
+
         partition_key = f"{request_id}:{fruit}"
         digest = hashlib.sha256(partition_key.encode("utf-8")).digest()
         return int.from_bytes(digest[:8], "big") % SUM_AMOUNT
 
-    def _aggregation_index(self, request_id, fruit):
+    def _aggregation_index(self, request_id: str, fruit: str) -> int:
+        #Calcula el ID del Aggregator de destino para enviar los totales de una fruta
+
         partition_key = f"{request_id}:{fruit}"
         digest = hashlib.sha256(partition_key.encode("utf-8")).digest()
         return int.from_bytes(digest[:8], "big") % AGGREGATION_AMOUNT
 
-    def _add_local_amount(self, request_id, fruit, amount):
+    def _add_local_amount(self, request_id: str, fruit: str, amount: int):
+        #Acumula en memoria local el valor especificado utilizando el operador + de la clase FruitItem
+       
         with self.state_lock:
             amount_by_fruit = self.amount_by_request.setdefault(request_id, {})
             amount_by_fruit[fruit] = amount_by_fruit.get(
                 fruit, fruit_item.FruitItem(fruit, 0)
             ) + fruit_item.FruitItem(fruit, int(amount))
 
-    def _trigger_eof_broadcast(self, request_id, publishers=None):
+    def _trigger_eof_broadcast(self, request_id: str, publishers=None):
+        #Trasmite el mensaje INTER_SUM_EOF a todas las replicas de Sum
+
         with self.state_lock:
             if request_id in self.eof_broadcast_sent:
                 return
@@ -85,7 +94,10 @@ class SumFilter:
                 )
             )
 
-    def process_data_message(self, message, ack, nack):
+    def process_data_message(self, message: bytes, ack: callable, nack: callable):
+        #Callback encargada de procesar los mensajes de la cola de ingesta principal.Redirige el dato al nodo Sum correspondiente segun la funcion de hash o
+        #dispara la senial  de finalizacion al recibir un EOF.
+        
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 4 and fields[1] == "DATA":
             request_id, _, fruit, amount = fields
@@ -106,16 +118,17 @@ class SumFilter:
             return
         ack()
 
-    def _process_inter_sum_message(self, message, ack, nack):
+    def _process_inter_sum_message(self, message: bytes, ack: callable, nack: callable):
+        #Callback invocada en el hilo secundario para procesar mensajes inter-sum.Acumula registros reenviados por otros nodos Sum y coordina la barrera desincronizacio EOF
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 4 and fields[1] == "INTER_SUM_DATA":
             self._add_local_amount(fields[0], fields[2], fields[3])
         elif len(fields) == 3 and fields[1] == "INTER_SUM_EOF":
             request_id, _, sender_id = fields
-            
-            # Disparar broadcast propio si aún no se había enterado de la finalización
+
+            # Disparar broadcast propio si no sabiamos que ya se habia enviado
             self._trigger_eof_broadcast(request_id, self.inter_sum_publishers)
-            
+
             should_close = False
             with self.state_lock:
                 received = self.eofs_received_by_request.setdefault(request_id, set())
@@ -124,7 +137,7 @@ class SumFilter:
                     should_close = True
 
             if should_close:
-                # Agendar el cierre thread-safe en la conexión del hilo principal
+                # Agendar el cierre thread-safe sobre la conexion del hilo principal
                 self.input_queue.connection.add_callback_threadsafe(
                     lambda req=request_id: self._close_request(req)
                 )
@@ -133,7 +146,8 @@ class SumFilter:
             return
         ack()
 
-    def _close_request(self, request_id):
+    def _close_request(self, request_id: str):
+        #Cierra el request_id especifico: envia las sumas finales acumuladas a los nodos Aggregator correspondientes y emite los mensajes EOF de salida
         with self.state_lock:
             if request_id in self.closed_requests:
                 return
@@ -162,8 +176,9 @@ class SumFilter:
             )
 
     def start(self):
+        #Inicia el hilo secundario para mensajes inter-sum y arranca el consumo de la cola principal
         def consume_inter_sum():
-            # Conexiones exclusivas para el hilo secundario
+            # Conexiones exclusivas del hilo secundario para evitar race conditions en Pika
             self.inter_sum_publishers = [
                 middleware.MessageMiddlewareExchangeRabbitMQ(
                     MOM_HOST, SUM_PREFIX, [f"{SUM_PREFIX}_{i}"]
@@ -182,6 +197,7 @@ class SumFilter:
         self.input_queue.start_consuming(self.process_data_message)
 
     def request_shutdown(self):
+        #Detiene de forma no bloqueante los bucles de consumo de RabbitMQ
         if self.shutdown_requested:
             return
         self.shutdown_requested = True
@@ -192,6 +208,7 @@ class SumFilter:
             )
 
     def shutdown(self):
+        #Libera de forma limpia todas las conexiones y canales creados en RabbitMQ
         self.request_shutdown()
         if self.sum_inter_thread is not None and self.sum_inter_thread.is_alive():
             self.sum_inter_thread.join(timeout=5)
