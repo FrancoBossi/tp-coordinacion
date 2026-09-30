@@ -30,16 +30,9 @@ class AggregationFilter:
 
     def _process_data(self, request_id, fruit, amount):
         logging.info("Processing data message")
-        # El top parcial se calcula independientemente para cada consulta.
+        # Inserción ordenada directa sin sumas (+)
         fruit_top = self.fruit_top_by_request.setdefault(request_id, [])
-        for i in range(len(fruit_top)):
-            if fruit_top[i].fruit == fruit:
-                fruit_top[i] = fruit_top[i] + fruit_item.FruitItem(
-                    fruit, amount
-                )
-                fruit_top.sort()
-                return
-        bisect.insort(fruit_top, fruit_item.FruitItem(fruit, amount))
+        bisect.insort(fruit_top, fruit_item.FruitItem(fruit, int(amount)))
 
     def _process_eof(self, request_id, sum_id):
         logging.info("Received EOF from Sum")
@@ -48,14 +41,15 @@ class AggregationFilter:
         if len(completed_sums) < SUM_AMOUNT:
             return
 
-        # El resultado conserva el request_id para que el Gateway lo correlacione.
         fruit_top = self.fruit_top_by_request.pop(request_id, [])
         self.completed_sums_by_request.pop(request_id, None)
+
         fruit_chunk = list(fruit_top[-TOP_SIZE:])
         fruit_chunk.reverse()
+
         serialized_fruit_top = list(
             map(
-                lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
+                lambda item: (item.fruit, item.amount),
                 fruit_chunk,
             )
         )
@@ -66,7 +60,6 @@ class AggregationFilter:
         )
 
     def process_messsage(self, message, ack, nack):
-        logging.info("Process message")
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 4 and fields[1] == "DATA":
             self._process_data(fields[0], fields[2], fields[3])
@@ -81,26 +74,28 @@ class AggregationFilter:
         self.input_exchange.start_consuming(self.process_messsage)
 
     def request_shutdown(self):
-        #Solicita detener el consumo sin cerrar la conexion activa
         if self.shutdown_requested:
             return
         self.shutdown_requested = True
         self.input_exchange.stop_consuming()
 
     def shutdown(self):
-        #cerramos las conexiones despues de detener el consumo
         self.request_shutdown()
-        self.input_exchange.close() #cerramos conexion
-        self.output_queue.close() #cerramos conexion
+        self.input_exchange.close()
+        self.output_queue.close()
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
     aggregation_filter = AggregationFilter()
-    signal.signal(
-        signal.SIGTERM,
-        lambda signum, frame: aggregation_filter.request_shutdown(),
-    )
+
+    def handle_signal(signum, frame):
+        logging.info(f"Signal {signum} received, stopping AggregationFilter...")
+        aggregation_filter.request_shutdown()
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
     try:
         aggregation_filter.start()
     finally:

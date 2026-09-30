@@ -32,20 +32,24 @@ class JoinFilter:
         if len(fields) != 4 or fields[1] != "PARTIAL_TOP":
             nack()
             return
-        partial_tops = self.partial_tops_by_request.setdefault(fields[0], {})
-        partial_tops[fields[2]] = fields[3]
+        request_id, _, aggregation_id, partial_top = fields
+        partial_tops = self.partial_tops_by_request.setdefault(request_id, {})
+        partial_tops[aggregation_id] = partial_top
         if len(partial_tops) == AGGREGATION_AMOUNT:
-            totals = {}
-            for partial_top in partial_tops.values():
-                for fruit, amount in partial_top:
-                    totals[fruit] = totals.get(fruit, 0) + int(amount)
-            final_top = sorted(
-                totals.items(), key=lambda item: (item[1], item[0]), reverse=True
-            )[:TOP_SIZE]
-            self.partial_tops_by_request.pop(fields[0], None)
+            all_items = [
+                fruit_item.FruitItem(fruit, int(amount))
+                for partial_top in partial_tops.values()
+                for fruit, amount in partial_top
+            ]
+            all_items.sort()
+            all_items.reverse()
+            top_chunk = all_items[:TOP_SIZE]
+            final_top = [(item.fruit, item.amount) for item in top_chunk]
+
+            self.partial_tops_by_request.pop(request_id, None)
             self.output_queue.send(
                 message_protocol.internal.serialize(
-                    [fields[0], "FINAL_TOP", final_top]
+                    [request_id, "FINAL_TOP", final_top]
                 )
             )
         ack()
@@ -54,26 +58,28 @@ class JoinFilter:
         self.input_queue.start_consuming(self.process_messsage)
 
     def request_shutdown(self):
-        #Solicita detener el consumo sin cerrar la conexion activa
         if self.shutdown_requested:
             return
         self.shutdown_requested = True
         self.input_queue.stop_consuming()
 
     def shutdown(self):
-        #cierra las conexiones despues de detener el consumo
         self.request_shutdown()
-        self.input_queue.close() #conexion cerrada
-        self.output_queue.close() #conexion cerrada
+        self.input_queue.close()
+        self.output_queue.close()
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
     join_filter = JoinFilter()
-    signal.signal(
-        signal.SIGTERM,
-        lambda signum, frame: join_filter.request_shutdown(),
-    )
+
+    def handle_signal(signum, frame):
+        logging.info(f"Signal {signum} received, stopping JoinFilter...")
+        join_filter.request_shutdown()
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
     try:
         join_filter.start()
     finally:
