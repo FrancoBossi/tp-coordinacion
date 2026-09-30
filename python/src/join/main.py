@@ -4,6 +4,7 @@ import signal
 
 from common import middleware, message_protocol, fruit_item
 
+# Configuración del nodo desde variables de entorno
 MOM_HOST = os.environ["MOM_HOST"]
 INPUT_QUEUE = os.environ["INPUT_QUEUE"]
 OUTPUT_QUEUE = os.environ["OUTPUT_QUEUE"]
@@ -15,8 +16,9 @@ TOP_SIZE = int(os.environ["TOP_SIZE"])
 
 
 class JoinFilter:
-
+    
     def __init__(self):
+        #Inicializa las colas middleware de entrada y salida
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, INPUT_QUEUE
         )
@@ -26,7 +28,9 @@ class JoinFilter:
         self.partial_tops_by_request = {}
         self.shutdown_requested = False
 
-    def process_messsage(self, message, ack, nack):
+    def process_messsage(self, message: bytes, ack: callable, nack: callable):
+        #Procesa los mensajes PARTIAL_TOP recibidos de las replicas de Aggregation
+
         logging.info("Received top")
         fields = message_protocol.internal.deserialize(message)
         if len(fields) != 4 or fields[1] != "PARTIAL_TOP":
@@ -35,7 +39,9 @@ class JoinFilter:
         request_id, _, aggregation_id, partial_top = fields
         partial_tops = self.partial_tops_by_request.setdefault(request_id, {})
         partial_tops[aggregation_id] = partial_top
+
         if len(partial_tops) == AGGREGATION_AMOUNT:
+            # Reconstrucción de FruitItem para aprovechar su operador de comparación opaco (<)
             all_items = [
                 fruit_item.FruitItem(fruit, int(amount))
                 for partial_top in partial_tops.values()
@@ -55,18 +61,21 @@ class JoinFilter:
         ack()
 
     def start(self):
+        #Comienza el consumo de mensajes desde la cola del Joiner
         self.input_queue.start_consuming(self.process_messsage)
 
     def request_shutdown(self):
+        #Cancela el consumo de la cola de entrada
         if self.shutdown_requested:
             return
         self.shutdown_requested = True
         self.input_queue.stop_consuming()
 
     def shutdown(self):
+        #Cierra las conexiones del Joiner
         self.request_shutdown()
-        self.input_queue.close()
-        self.output_queue.close()
+        self.input_queue.close() #cierro la conexion
+        self.output_queue.close() #cierro la conexion
 
 
 def main():
