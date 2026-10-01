@@ -17,7 +17,6 @@ TOP_SIZE = int(os.environ["TOP_SIZE"])
 
 class AggregationFilter:
 
-    #se inicializa los componentes middleware y estructuras de estado interno
     def __init__(self):
         self.input_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{ID}"]
@@ -31,27 +30,32 @@ class AggregationFilter:
 
     def _process_data(self, request_id, fruit, amount):
         logging.info("Processing data message")
-        # IInserta el elemento de forma ordenada
+        # El top parcial se calcula independientemente para cada consulta.
         fruit_top = self.fruit_top_by_request.setdefault(request_id, [])
-        bisect.insort(fruit_top, fruit_item.FruitItem(fruit, int(amount)))
+        for i in range(len(fruit_top)):
+            if fruit_top[i].fruit == fruit:
+                fruit_top[i] = fruit_top[i] + fruit_item.FruitItem(
+                    fruit, amount
+                )
+                fruit_top.sort()
+                return
+        bisect.insort(fruit_top, fruit_item.FruitItem(fruit, amount))
 
     def _process_eof(self, request_id, sum_id):
-        #Registra la recepcion de EOF de una replica de Sum
         logging.info("Received EOF from Sum")
         completed_sums = self.completed_sums_by_request.setdefault(request_id, set())
         completed_sums.add(int(sum_id))
         if len(completed_sums) < SUM_AMOUNT:
             return
 
+        # El resultado conserva el request_id para que el Gateway lo correlacione.
         fruit_top = self.fruit_top_by_request.pop(request_id, [])
         self.completed_sums_by_request.pop(request_id, None)
-
         fruit_chunk = list(fruit_top[-TOP_SIZE:])
         fruit_chunk.reverse()
-
         serialized_fruit_top = list(
             map(
-                lambda item: (item.fruit, item.amount),
+                lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
                 fruit_chunk,
             )
         )
@@ -62,7 +66,7 @@ class AggregationFilter:
         )
 
     def process_messsage(self, message, ack, nack):
-        #Deserializa y procesa los mensajes entrantes (DATA o EOF) administrando el ACK
+        logging.info("Process message")
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 4 and fields[1] == "DATA":
             self._process_data(fields[0], fields[2], fields[3])
@@ -74,34 +78,29 @@ class AggregationFilter:
         ack()
 
     def start(self):
-        #Comienza la recepcion de mensajes desde el exchange de entrada
         self.input_exchange.start_consuming(self.process_messsage)
 
     def request_shutdown(self):
-        #Detiene el bucle de consumo de mensajes
+        #Solicita detener el consumo sin cerrar la conexion activa
         if self.shutdown_requested:
             return
         self.shutdown_requested = True
         self.input_exchange.stop_consuming()
 
     def shutdown(self):
-        #Cierra las conexiones a RabbitMQ
+        #cerramos las conexiones despues de detener el consumo
         self.request_shutdown()
-        self.input_exchange.close() #se cierra la conexion
-        self.output_queue.close() #se cierra la conexion
+        self.input_exchange.close() #cerramos conexion
+        self.output_queue.close() #cerramos conexion
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
     aggregation_filter = AggregationFilter()
-
-    def handle_signal(signum, frame):
-        logging.info(f"Signal {signum} received, stopping AggregationFilter...")
-        aggregation_filter.request_shutdown()
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
-
+    signal.signal(
+        signal.SIGTERM,
+        lambda signum, frame: aggregation_filter.request_shutdown(),
+    )
     try:
         aggregation_filter.start()
     finally:
