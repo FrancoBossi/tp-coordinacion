@@ -1,124 +1,147 @@
-# Informe de coordinación
+# Informe de coordinación y escalabilidad
 
-## Identificación de consultas
+## 1. Identificación de las consultas
 
 Cada conexión aceptada por el Gateway representa una consulta independiente.
-Al crear el `MessageHandler` se genera un identificador único (`request_id`).
-Este identificador no modifica el protocolo externo utilizado entre el cliente y
-el Gateway: se incorpora únicamente a los mensajes internos del sistema.
+Para identificarla, el `MessageHandler` genera un `request_id` único. Este
+identificador no modifica el protocolo externo entre el cliente y el Gateway:
+se agrega únicamente a los mensajes internos.
 
-Los mensajes internos de datos tienen la forma:
+Los mensajes de datos tienen la siguiente estructura:
 
 ```text
 [request_id, "DATA", fruta, cantidad]
 ```
 
-El fin de una consulta se representa como:
+El cierre de la entrada se informa mediante:
 
 ```text
-[request_id, "EOF"]
+[request_id, "EOF", cantidad_de_registros]
 ```
 
-El `request_id` se conserva durante todo el pipeline, lo que permite mantener
-separados los datos y los resultados de clientes concurrentes.
+El `request_id` acompaña a los datos y a todos los mensajes de coordinación
+hasta la respuesta final. De este modo, los estados de consultas concurrentes
+se mantienen separados y el Gateway puede entregar cada resultado al cliente
+correspondiente.
 
-## Coordinación de Sum
+## 2. Coordinación de las instancias de Sum
 
-Las instancias de Sum consumen la cola compartida de entrada. RabbitMQ reparte
-los mensajes entre las réplicas, por lo que cada instancia procesa una parte de
-los registros recibidos.
+Las instancias de Sum consumen una cola de entrada compartida. RabbitMQ
+distribuye los mensajes entre las réplicas, permitiendo que procesen
+concurrentemente distintos registros.
 
-Cada Sum mantiene acumuladores independientes por `request_id`. Para evitar que
-el uso de memoria crezca indefinidamente con el volumen de datos, los
-acumuladores se dividen en lotes limitados por `SUM_BATCH_SIZE`. Cuando un lote
-alcanza el límite configurado, Sum envía sus subtotales y libera la memoria
-asociada. Al recibir el cierre de una consulta, el Gateway incluye en el mensaje EOF la
-cantidad total de registros de esa consulta. Cada Sum informa su progreso por
-`request_id` y por instancia. Las réplicas mantienen una barrera distribuida y
-envían el lote restante y su notificación de finalización sólo cuando la suma
-de los progresos alcanza la cantidad total esperada.
-
-Las notificaciones de progreso y de cierre se publican mediante un exchange de
-control para que todas las réplicas de Sum conozcan el estado de la consulta.
-El cierre de cada Sum se publica en el mismo flujo de salida que sus datos, de
-modo que Aggregation recibe los mensajes DATA antes del EOF correspondiente.
-Aggregation considera finalizada una consulta cuando recibe la notificación de
-todas las instancias de Sum configuradas.
-
-## Distribución entre Aggregation
-
-Los subtotales no se envían por broadcast a todas las instancias de
-Aggregation. Para cada fruta se calcula una partición determinista utilizando
-el identificador de la consulta y el nombre de la fruta:
+Para garantizar que una fruta se sume en un único lugar, cada par
+`(request_id, fruta)` se asigna determinísticamente a una réplica de Sum:
 
 ```text
-hash(request_id + fruta) % cantidad_de_aggregators
+hash(request_id + fruta) % cantidad_de_sums
 ```
 
-El resultado se publica únicamente en el exchange asociado al Aggregator
-seleccionado. De esta manera, una fruta de una consulta siempre es procesada
-por una sola instancia y se evita el procesamiento redundante. Al incluir el
-`request_id`, distintos clientes pueden distribuir sus frutas de manera
-independiente y aprovechar todas las réplicas disponibles.
+Si el registro llega a una réplica distinta de la responsable, se reenvía a
+través de una cola durable de comunicación entre instancias (`INTER_SUM_DATA`).
+La réplica responsable acumula todos los registros de esa fruta utilizando
+`FruitItem.__add__`. Por lo tanto, la operación de suma se realiza únicamente
+en Sum.
 
-Cada Aggregator mantiene un top parcial separado por consulta. Cuando recibe la
-finalización de todas las instancias de Sum, calcula su top parcial y lo envía
-al Join junto con su propio identificador:
+Cada instancia mantiene sus acumuladores separados por `request_id`. Al
+recibir un registro procesado, informa su progreso. Cuando el Gateway recibe el
+fin de una consulta, incluye la cantidad total de registros enviados. Esa
+cantidad se distribuye mediante las colas de control durables, junto con los
+mensajes de progreso de cada réplica.
+
+La consulta se considera completa cuando la suma de los progresos de todas las
+réplicas alcanza la cantidad total esperada. Recién entonces cada Sum publica
+sus subtotales y su mensaje `EOF`. Los datos se publican antes del `EOF`
+correspondiente para garantizar que Aggregation no finalice prematuramente.
+
+## 3. Coordinación de las instancias de Aggregation
+
+Sum envía un único subtotal definitivo por fruta. Aggregation no vuelve a
+sumar cantidades y no utiliza `FruitItem.__add__`: conserva los subtotales
+recibidos y los ordena para construir un top parcial.
+
+Los subtotales se distribuyen sin broadcast. La instancia de Aggregation se
+selecciona mediante una partición determinística:
+
+```text
+hash(request_id + fruta) % cantidad_de_aggregations
+```
+
+Así, todos los subtotales de una consulta llegan a una única réplica de
+Aggregation y cada réplica procesa una parte diferente del trabajo.
+
+Cada Aggregation espera recibir el `EOF` de todas las instancias de Sum. Una
+vez cumplida esa barrera, publica un resultado parcial con su identificador:
 
 ```text
 [request_id, "PARTIAL_TOP", aggregation_id, top_parcial]
 ```
 
-## Coordinación de Join
-
-Join agrupa los resultados parciales por `request_id` y por
-`aggregation_id`. No genera el resultado final al recibir un único parcial:
-espera un resultado de cada Aggregator configurado. Luego combina los parciales,
-acumula los valores de frutas repetidas y calcula el top final.
-
-El resultado se envía al Gateway con la forma:
+Join espera un resultado parcial de cada Aggregation. Luego reúne los parciales
+y produce el resultado final:
 
 ```text
 [request_id, "FINAL_TOP", top_final]
 ```
 
-El Gateway utiliza el `request_id` para entregar la respuesta al cliente
-correspondiente.
+El Gateway utiliza el `request_id` para asociar ese resultado con el cliente
+que originó la consulta.
 
-## Escalabilidad
+## 4. Escalabilidad respecto de los clientes
 
-### Cantidad de clientes
+El sistema puede atender varias consultas concurrentes utilizando las mismas
+colas y réplicas. La separación no depende de crear una infraestructura
+distinta para cada cliente, sino de conservar el `request_id` en todos los
+mensajes y estructuras de estado.
 
-Los datos de varias consultas pueden circular por las mismas colas sin mezclarse,
-porque todos los mensajes internos llevan `request_id` y cada control mantiene
-su estado separado por consulta. Las respuestas también se correlacionan con
-su cliente mediante ese identificador.
+Los acumuladores, las barreras de finalización y los resultados parciales se
+indexan por `request_id`. Por lo tanto, la finalización o el resultado de una
+consulta no afecta el procesamiento de otra consulta concurrente.
 
-### Grandes volúmenes de datos
+Además, el hash incluye el identificador de la consulta. Esto evita que todas
+las consultas distribuyan necesariamente las mismas frutas sobre las mismas
+réplicas y favorece un reparto más equilibrado del trabajo.
 
-El procesamiento se realiza de forma incremental. Sum no necesita conservar en
-memoria todos los registros recibidos: acumula una cantidad limitada de frutas
-distintas, envía subtotales parciales y libera cada lote. Aggregation combina
-esos subtotales, por lo que el volumen total de registros puede ser mayor que
-la memoria disponible para un único lote.
+## 5. Escalabilidad frente a grandes volúmenes de datos
 
-### Cantidad de controles
+Los registros se procesan de manera incremental. Sum no conserva la secuencia
+completa de entrada: cada registro se suma en el acumulador correspondiente o
+se reenvía a la réplica responsable. Una vez procesado, el registro original
+deja de ocupar espacio en la cola de trabajo.
 
-La cantidad de réplicas se obtiene de la configuración del escenario. Las
-instancias de Sum se reparten los mensajes de entrada mediante RabbitMQ y cada
-fruta se enruta a un único Aggregator usando una partición determinista. Join
-espera la participación de todas las réplicas de Aggregation antes de producir
-el resultado final. Así, las réplicas agregan capacidad de procesamiento en
-lugar de repetir el mismo trabajo.
+La memoria utilizada por Sum depende principalmente de la cantidad de frutas
+distintas activas por consulta, y no de la cantidad total de registros
+recibidos. Aggregation tampoco conserva los registros originales: almacena los
+subtotales necesarios para calcular su top parcial.
 
-## Terminación ordenada
+La barrera basada en el conteo de registros permite detectar que todas las
+instancias terminaron de procesar la entrada antes de publicar los resultados.
+De esta manera, el sistema evita depender de una única réplica para detectar el
+fin de la consulta.
 
-Sum, Aggregation y Join registran un handler para la señal `SIGTERM`. El handler
-solicita detener el consumo de mensajes, pero no cierra inmediatamente la
-conexión que todavía está siendo utilizada por RabbitMQ. Una vez que el consumo
-finaliza, cada proceso cierra sus colas, exchanges y conexiones en un bloque
-`finally`.
+## 6. Escalabilidad respecto de la cantidad de controles
 
-Esta separación evita cerrar un descriptor mientras Pika está procesando
-eventos. Como resultado, las réplicas terminan limpiamente con código de salida
-`0` al detener los contenedores.
+La cantidad de réplicas de Sum y Aggregation se obtiene de la configuración
+del escenario. La solución no está ligada a una cantidad fija de instancias:
+
+- Sum reparte el trabajo de entrada y deriva cada fruta a una única réplica
+  responsable.
+- Aggregation recibe particiones exclusivas de los subtotales.
+- Join espera explícitamente la participación de todas las réplicas de
+  Aggregation.
+
+Por lo tanto, agregar réplicas aumenta la capacidad de procesamiento sin
+replicar innecesariamente el mismo trabajo. Las colas durables de datos y de
+control también permiten que los mensajes no se pierdan si una instancia tarda
+en iniciar.
+
+## 7. Terminación ordenada
+
+Sum, Aggregation y Join registran handlers para `SIGTERM` y `SIGINT`. Ante una
+señal, cada proceso solicita detener el consumo y conserva abiertas las
+conexiones mientras RabbitMQ termina de procesar la operación de cierre.
+
+Cuando el consumo finaliza, el bloque `finally` cierra las colas, exchanges y
+conexiones utilizadas por el proceso. Esta secuencia evita cerrar un descriptor
+mientras Pika todavía lo está utilizando y permite que los contenedores
+terminen correctamente con código de salida `0`.
