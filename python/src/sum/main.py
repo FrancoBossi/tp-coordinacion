@@ -14,8 +14,6 @@ SUM_PREFIX = os.environ["SUM_PREFIX"]
 SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
-SUM_BATCH_SIZE = int(os.environ.get("SUM_BATCH_SIZE", "1000"))
-
 class SumFilter:
     def __init__(self):
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
@@ -30,6 +28,20 @@ class SumFilter:
         self.control_publisher = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, SUM_CONTROL_EXCHANGE, ["CONTROL"]
         )
+        self.inter_sum_control_publisher = (
+            middleware.MessageMiddlewareExchangeRabbitMQ(
+                MOM_HOST, SUM_CONTROL_EXCHANGE, ["CONTROL"]
+            )
+        )
+        self.inter_sum_input = middleware.MessageMiddlewareQueueRabbitMQ(
+            MOM_HOST, f"{SUM_PREFIX}_inter_{ID}"
+        )
+        self.inter_sum_outputs = [
+            middleware.MessageMiddlewareQueueRabbitMQ(
+                MOM_HOST, f"{SUM_PREFIX}_inter_{i}"
+            )
+            for i in range(SUM_AMOUNT)
+        ]
         self.amount_by_request = {}
         self.local_processed_by_request = {}
         self.progress_by_request = {}
@@ -39,6 +51,7 @@ class SumFilter:
         self.shutdown_event = threading.Event()
         self.control_exchange = None
         self.control_thread = None
+        self.inter_sum_thread = None
         self.shutdown_requested = False
 
     def _aggregation_index(self, request_id, fruit):
@@ -46,24 +59,6 @@ class SumFilter:
         partition_key = f"{request_id}:{fruit}"
         digest = hashlib.sha256(partition_key.encode("utf-8")).digest()
         return int.from_bytes(digest[:8], "big") % AGGREGATION_AMOUNT
-
-    def _flush_request(self, request_id):
-        #enviamos un lote y libera el acumulador de una consulta
-        amount_by_fruit = self.amount_by_request.pop(request_id, {})
-        for final_fruit_item in amount_by_fruit.values():
-            data_output_exchange = self.data_output_exchanges[
-                self._aggregation_index(request_id, final_fruit_item.fruit)
-            ]
-            data_output_exchange.send(
-                message_protocol.internal.serialize(
-                    [
-                        request_id,
-                        "DATA",
-                        final_fruit_item.fruit,
-                        final_fruit_item.amount,
-                    ]
-                )
-            )
 
     def _process_data(self, request_id, fruit, amount):
         logging.info(f"Process data")
@@ -74,15 +69,12 @@ class SumFilter:
                 fruit, fruit_item.FruitItem(fruit, 0)
             ) + fruit_item.FruitItem(fruit, int(amount))
 
-            if len(amount_by_fruit) >= SUM_BATCH_SIZE:
-                logging.info("Flushing data batch")
-                self._flush_request(request_id)
+    def _sum_owner_index(self, request_id, fruit):
+        partition_key = f"{request_id}:{fruit}"
+        digest = hashlib.sha256(partition_key.encode("utf-8")).digest()
+        return int.from_bytes(digest[:8], "big") % SUM_AMOUNT
 
     def _process_eof(self, request_id):
-        logging.info(f"Broadcasting data messages")
-        # Envia el ultimo lote, los anteriores ya fueron liberados al alcanzar el limite
-        self._flush_request(request_id)
-
         logging.info(f"Publishing EOF notification for sum {ID}")
         self.control_publisher.send(
             message_protocol.internal.serialize([request_id, "EOF", ID])
@@ -162,17 +154,18 @@ class SumFilter:
     def process_data_messsage(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 4 and fields[1] == "DATA":
-            self._process_data(fields[0], fields[2], fields[3])
-            with self.state_lock:
-                processed = (
-                    self.local_processed_by_request.get(fields[0], 0) + 1
+            request_id, fruit, amount = fields[0], fields[2], fields[3]
+            owner_id = self._sum_owner_index(request_id, fruit)
+            if owner_id != ID:
+                self.inter_sum_outputs[owner_id].send(
+                    message_protocol.internal.serialize(
+                        [request_id, "INTER_SUM_DATA", fruit, amount]
+                    )
                 )
-                self.local_processed_by_request[fields[0]] = processed
-            self.control_publisher.send(
-                message_protocol.internal.serialize(
-                    [fields[0], "PROGRESS", [ID, processed]]
+            else:
+                self._process_owned_data(
+                    request_id, fruit, amount, self.control_publisher
                 )
-            )
         elif len(fields) == 3 and fields[1] == "EOF":
             self.control_publisher.send(
                 message_protocol.internal.serialize(
@@ -182,6 +175,31 @@ class SumFilter:
         else:
             nack()
             return
+        ack()
+
+    def _process_owned_data(self, request_id, fruit, amount, control_publisher):
+        self._process_data(request_id, fruit, amount)
+        with self.state_lock:
+            processed = self.local_processed_by_request.get(request_id, 0) + 1
+            self.local_processed_by_request[request_id] = processed
+        control_publisher.send(
+            message_protocol.internal.serialize(
+                [request_id, "PROGRESS", [ID, processed]]
+            )
+        )
+
+    def process_inter_sum_message(self, message, ack, nack):
+        fields = message_protocol.internal.deserialize(message)
+        if len(fields) != 4 or fields[1] != "INTER_SUM_DATA":
+            nack()
+            return
+        request_id, fruit, amount = fields[0], fields[2], fields[3]
+        if self._sum_owner_index(request_id, fruit) != ID:
+            nack()
+            return
+        self._process_owned_data(
+            request_id, fruit, amount, self.inter_sum_control_publisher
+        )
         ack()
 
     def start(self):
@@ -198,6 +216,13 @@ class SumFilter:
 
         self.control_thread = threading.Thread(target=consume_control, daemon=True)
         self.control_thread.start()
+        self.inter_sum_thread = threading.Thread(
+            target=lambda: self.inter_sum_input.start_consuming(
+                self.process_inter_sum_message
+            ),
+            daemon=True,
+        )
+        self.inter_sum_thread.start()
         self.input_queue.start_consuming(self.process_data_messsage)
 
     def request_shutdown(self):
@@ -207,6 +232,9 @@ class SumFilter:
         self.shutdown_requested = True
         self.shutdown_event.set()
         self.input_queue.stop_consuming()
+        self.inter_sum_input.connection.add_callback_threadsafe(
+            self.inter_sum_input.stop_consuming
+        )
         if self.control_exchange is not None:
             self.control_exchange.connection.add_callback_threadsafe(
                 self.control_exchange.stop_consuming
@@ -217,10 +245,16 @@ class SumFilter:
         self.request_shutdown()
         if self.control_thread is not None:
             self.control_thread.join(timeout=5)
+        if self.inter_sum_thread is not None:
+            self.inter_sum_thread.join(timeout=5)
         self.input_queue.close()
+        self.inter_sum_input.close()
+        for inter_sum_output in self.inter_sum_outputs:
+            inter_sum_output.close()
         if self.control_exchange is not None:
             self.control_exchange.close()
         self.control_publisher.close()
+        self.inter_sum_control_publisher.close()
         for data_output_exchange in self.data_output_exchanges:
             data_output_exchange.close()
 

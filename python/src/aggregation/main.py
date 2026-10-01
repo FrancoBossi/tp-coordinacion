@@ -30,15 +30,13 @@ class AggregationFilter:
 
     def _process_data(self, request_id, fruit, amount):
         logging.info("Processing data message")
-        # El top parcial se calcula independientemente para cada consulta.
+        # Sum ya consolidó todos los registros de esta fruta. Aggregation sólo
+        # conserva el subtotal recibido y calcula el orden del top.
         fruit_top = self.fruit_top_by_request.setdefault(request_id, [])
-        for i in range(len(fruit_top)):
-            if fruit_top[i].fruit == fruit:
-                fruit_top[i] = fruit_top[i] + fruit_item.FruitItem(
-                    fruit, amount
-                )
-                fruit_top.sort()
-                return
+        if any(item.fruit == fruit for item in fruit_top):
+            raise ValueError(
+                f"Received duplicate subtotal for {request_id}:{fruit}"
+            )
         bisect.insort(fruit_top, fruit_item.FruitItem(fruit, amount))
 
     def _process_eof(self, request_id, sum_id):
