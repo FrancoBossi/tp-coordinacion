@@ -11,7 +11,6 @@ MOM_HOST = os.environ["MOM_HOST"]
 INPUT_QUEUE = os.environ["INPUT_QUEUE"]
 SUM_AMOUNT = int(os.environ["SUM_AMOUNT"])
 SUM_PREFIX = os.environ["SUM_PREFIX"]
-SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 class SumFilter:
@@ -25,14 +24,18 @@ class SumFilter:
                 MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
             )
             self.data_output_exchanges.append(data_output_exchange)
-        self.control_publisher = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, SUM_CONTROL_EXCHANGE, ["CONTROL"]
-        )
-        self.inter_sum_control_publisher = (
-            middleware.MessageMiddlewareExchangeRabbitMQ(
-                MOM_HOST, SUM_CONTROL_EXCHANGE, ["CONTROL"]
+        self.control_publishers = [
+            middleware.MessageMiddlewareQueueRabbitMQ(
+                MOM_HOST, f"{SUM_PREFIX}_control_{i}"
             )
-        )
+            for i in range(SUM_AMOUNT)
+        ]
+        self.inter_sum_control_publishers = [
+            middleware.MessageMiddlewareQueueRabbitMQ(
+                MOM_HOST, f"{SUM_PREFIX}_control_{i}"
+            )
+            for i in range(SUM_AMOUNT)
+        ]
         self.inter_sum_input = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, f"{SUM_PREFIX}_inter_{ID}"
         )
@@ -49,7 +52,9 @@ class SumFilter:
         self.closed_requests = set()
         self.state_lock = threading.Lock()
         self.shutdown_event = threading.Event()
-        self.control_exchange = None
+        self.control_queue = middleware.MessageMiddlewareQueueRabbitMQ(
+            MOM_HOST, f"{SUM_PREFIX}_control_{ID}"
+        )
         self.control_thread = None
         self.inter_sum_thread = None
         self.shutdown_requested = False
@@ -76,9 +81,7 @@ class SumFilter:
 
     def _process_eof(self, request_id):
         logging.info(f"Publishing EOF notification for sum {ID}")
-        self.control_publisher.send(
-            message_protocol.internal.serialize([request_id, "EOF", ID])
-        )
+        self._publish_control([request_id, "EOF", ID], self.control_publishers)
 
     def _process_control_message(self, message, ack, nack):
         #Actualiza la barrera de progreso y cierra consultas completas
@@ -164,13 +167,11 @@ class SumFilter:
                 )
             else:
                 self._process_owned_data(
-                    request_id, fruit, amount, self.control_publisher
+                    request_id, fruit, amount, self.control_publishers
                 )
         elif len(fields) == 3 and fields[1] == "EOF":
-            self.control_publisher.send(
-                message_protocol.internal.serialize(
-                    [fields[0], "EOF_REQUEST", fields[2]]
-                )
+            self._publish_control(
+                [fields[0], "EOF_REQUEST", fields[2]], self.control_publishers
             )
         else:
             nack()
@@ -182,11 +183,15 @@ class SumFilter:
         with self.state_lock:
             processed = self.local_processed_by_request.get(request_id, 0) + 1
             self.local_processed_by_request[request_id] = processed
-        control_publisher.send(
-            message_protocol.internal.serialize(
-                [request_id, "PROGRESS", [ID, processed]]
-            )
+        self._publish_control(
+            [request_id, "PROGRESS", [ID, processed]], control_publisher
         )
+
+    @staticmethod
+    def _publish_control(fields, publishers):
+        message = message_protocol.internal.serialize(fields)
+        for publisher in publishers:
+            publisher.send(message)
 
     def process_inter_sum_message(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
@@ -198,17 +203,14 @@ class SumFilter:
             nack()
             return
         self._process_owned_data(
-            request_id, fruit, amount, self.inter_sum_control_publisher
+            request_id, fruit, amount, self.inter_sum_control_publishers
         )
         ack()
 
     def start(self):
         # El exchange de control permite notificar EOF a todas las replicas de Sum
         def consume_control():
-            self.control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-                MOM_HOST, SUM_CONTROL_EXCHANGE, ["CONTROL"]
-            )
-            self.control_exchange.start_consuming(
+            self.control_queue.start_consuming(
                 lambda message, ack, nack: self._process_control_message(
                     message, ack, nack
                 )
@@ -235,10 +237,9 @@ class SumFilter:
         self.inter_sum_input.connection.add_callback_threadsafe(
             self.inter_sum_input.stop_consuming
         )
-        if self.control_exchange is not None:
-            self.control_exchange.connection.add_callback_threadsafe(
-                self.control_exchange.stop_consuming
-            )
+        self.control_queue.connection.add_callback_threadsafe(
+            self.control_queue.stop_consuming
+        )
 
     def shutdown(self):
         #Cierra las conexiones de Sum despues de detener los consumidores
@@ -251,10 +252,11 @@ class SumFilter:
         self.inter_sum_input.close()
         for inter_sum_output in self.inter_sum_outputs:
             inter_sum_output.close()
-        if self.control_exchange is not None:
-            self.control_exchange.close()
-        self.control_publisher.close()
-        self.inter_sum_control_publisher.close()
+        self.control_queue.close()
+        for publisher in self.control_publishers:
+            publisher.close()
+        for publisher in self.inter_sum_control_publishers:
+            publisher.close()
         for data_output_exchange in self.data_output_exchanges:
             data_output_exchange.close()
 
