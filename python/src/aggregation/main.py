@@ -28,7 +28,7 @@ class AggregationFilter:
         self.completed_sums_by_request = {}
         self.shutdown_requested = False
 
-    def _process_data(self, request_id, fruit, amount):
+    def process_data(self, request_id, fruit, amount):
         logging.info("Processing data message")
         # Sum ya consolidó todos los registros de esta fruta. Aggregation sólo
         # conserva el subtotal recibido y calcula el orden del top.
@@ -39,7 +39,7 @@ class AggregationFilter:
             )
         bisect.insort(fruit_top, fruit_item.FruitItem(fruit, amount))
 
-    def _process_eof(self, request_id, sum_id):
+    def process_eof(self, request_id, sum_id):
         logging.info("Received EOF from Sum")
         completed_sums = self.completed_sums_by_request.setdefault(request_id, set())
         completed_sums.add(int(sum_id))
@@ -67,9 +67,9 @@ class AggregationFilter:
         logging.info("Process message")
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 4 and fields[1] == "DATA":
-            self._process_data(fields[0], fields[2], fields[3])
+            self.process_data(fields[0], fields[2], fields[3])
         elif len(fields) == 3 and fields[1] == "EOF":
-            self._process_eof(fields[0], fields[2])
+            self.process_eof(fields[0], fields[2])
         else:
             nack()
             return

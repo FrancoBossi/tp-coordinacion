@@ -59,13 +59,13 @@ class SumFilter:
         self.inter_sum_thread = None
         self.shutdown_requested = False
 
-    def _aggregation_index(self, request_id, fruit):
+    def aggregation_index(self, request_id, fruit):
         #Distribuye cada fruta de una consulta en un unico Aggregator
         partition_key = f"{request_id}:{fruit}"
         digest = hashlib.sha256(partition_key.encode("utf-8")).digest()
         return int.from_bytes(digest[:8], "big") % AGGREGATION_AMOUNT
 
-    def _process_data(self, request_id, fruit, amount):
+    def process_data(self, request_id, fruit, amount):
         logging.info(f"Process data")
         with self.state_lock:
             # Cada cliente conserva su propio acumulador para evitar mezclar otras/futuras consultas
@@ -74,16 +74,16 @@ class SumFilter:
                 fruit, fruit_item.FruitItem(fruit, 0)
             ) + fruit_item.FruitItem(fruit, int(amount))
 
-    def _sum_owner_index(self, request_id, fruit):
+    def sum_owner_index(self, request_id, fruit):
         partition_key = f"{request_id}:{fruit}"
         digest = hashlib.sha256(partition_key.encode("utf-8")).digest()
         return int.from_bytes(digest[:8], "big") % SUM_AMOUNT
 
-    def _process_eof(self, request_id):
+    def process_eof(self, request_id):
         logging.info(f"Publishing EOF notification for sum {ID}")
-        self._publish_control([request_id, "EOF", ID], self.control_publishers)
+        self.publish_control([request_id, "EOF", ID], self.control_publishers)
 
-    def _process_control_message(self, message, ack, nack):
+    def process_control_message(self, message, ack, nack):
         #Actualiza la barrera de progreso y cierra consultas completas
         fields = message_protocol.internal.deserialize(message)
         if len(fields) != 3:
@@ -100,12 +100,12 @@ class SumFilter:
             else:
                 nack()
                 return
-            should_close = self._request_is_complete(request_id)
+            should_close = self.request_is_complete(request_id)
         if should_close:
-            self._schedule_close(request_id)
+            self.schedule_close(request_id)
         ack()
 
-    def _request_is_complete(self, request_id):
+    def request_is_complete(self, request_id):
         #Indica si todos los registros de una consulta ya fueron procesados
         expected = self.expected_by_request.get(request_id)
         progress = self.progress_by_request.get(request_id, {})
@@ -115,19 +115,19 @@ class SumFilter:
             and request_id not in self.closed_requests
         )
 
-    def _schedule_close(self, request_id):
+    def schedule_close(self, request_id):
         #Programa el cierre en el hilo que publica los datos de Sum
         self.input_queue.connection.add_callback_threadsafe(
-            lambda: self._close_request(request_id)
+            lambda: self.close_request(request_id)
         )
 
-    def _close_request(self, request_id):
+    def close_request(self, request_id):
         #Publica el cierre despues de que todos los Sum procesaron sus datos
         with self.state_lock:
             if request_id in self.closed_requests:
                 return
             self.closed_requests.add(request_id)
-            self._flush_request_to_exchanges(request_id, self.data_output_exchanges)
+            self.flush_request_to_exchanges(request_id, self.data_output_exchanges)
             for data_output_exchange in self.data_output_exchanges:
                 data_output_exchange.send(
                     message_protocol.internal.serialize([request_id, "EOF", ID])
@@ -136,12 +136,12 @@ class SumFilter:
             self.progress_by_request.pop(request_id, None)
             self.expected_by_request.pop(request_id, None)
 
-    def _flush_request_to_exchanges(self, request_id, output_exchanges):
+    def flush_request_to_exchanges(self, request_id, output_exchanges):
         #Envia un lote usando exchanges pertenecientes al hilo consumidor
         amount_by_fruit = self.amount_by_request.pop(request_id, {})
         for final_fruit_item in amount_by_fruit.values():
             output_exchange = output_exchanges[
-                self._aggregation_index(request_id, final_fruit_item.fruit)
+                self.aggregation_index(request_id, final_fruit_item.fruit)
             ]
             output_exchange.send(
                 message_protocol.internal.serialize(
@@ -158,7 +158,7 @@ class SumFilter:
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 4 and fields[1] == "DATA":
             request_id, fruit, amount = fields[0], fields[2], fields[3]
-            owner_id = self._sum_owner_index(request_id, fruit)
+            owner_id = self.sum_owner_index(request_id, fruit)
             if owner_id != ID:
                 self.inter_sum_outputs[owner_id].send(
                     message_protocol.internal.serialize(
@@ -166,11 +166,11 @@ class SumFilter:
                     )
                 )
             else:
-                self._process_owned_data(
+                self.process_owned_data(
                     request_id, fruit, amount, self.control_publishers
                 )
         elif len(fields) == 3 and fields[1] == "EOF":
-            self._publish_control(
+            self.publish_control(
                 [fields[0], "EOF_REQUEST", fields[2]], self.control_publishers
             )
         else:
@@ -178,17 +178,17 @@ class SumFilter:
             return
         ack()
 
-    def _process_owned_data(self, request_id, fruit, amount, control_publisher):
-        self._process_data(request_id, fruit, amount)
+    def process_owned_data(self, request_id, fruit, amount, control_publisher):
+        self.process_data(request_id, fruit, amount)
         with self.state_lock:
             processed = self.local_processed_by_request.get(request_id, 0) + 1
             self.local_processed_by_request[request_id] = processed
-        self._publish_control(
+        self.publish_control(
             [request_id, "PROGRESS", [ID, processed]], control_publisher
         )
 
     @staticmethod
-    def _publish_control(fields, publishers):
+    def publish_control(fields, publishers):
         message = message_protocol.internal.serialize(fields)
         for publisher in publishers:
             publisher.send(message)
@@ -199,10 +199,10 @@ class SumFilter:
             nack()
             return
         request_id, fruit, amount = fields[0], fields[2], fields[3]
-        if self._sum_owner_index(request_id, fruit) != ID:
+        if self.sum_owner_index(request_id, fruit) != ID:
             nack()
             return
-        self._process_owned_data(
+        self.process_owned_data(
             request_id, fruit, amount, self.inter_sum_control_publishers
         )
         ack()
@@ -211,7 +211,7 @@ class SumFilter:
         # El exchange de control permite notificar EOF a todas las replicas de Sum
         def consume_control():
             self.control_queue.start_consuming(
-                lambda message, ack, nack: self._process_control_message(
+                lambda message, ack, nack: self.process_control_message(
                     message, ack, nack
                 )
             )
